@@ -24,11 +24,12 @@ import (
 	"github.com/lessos/lessgo/encoding/json"
 	ps_cpu "github.com/shirou/gopsutil/cpu"
 
-	"github.com/hooto/hchart/hcapi"
-	"github.com/hooto/hchart/hcutil"
+	"github.com/hooto/hchart/v2/hcapi"
+	// "github.com/hooto/hchart/v2/hcutil"
 )
 
 type KeyValueBenchWorker interface {
+	Attrs() []string
 	Write(key, value []byte) ResultStatus
 	Read(key []byte) ResultStatus
 	Clean() error
@@ -44,21 +45,19 @@ type keyValueWriteUsageItem struct {
 }
 
 type keyValueBenchOptions struct {
-	types          []uint64
-	argsName       string
-	timeLen        int64 // seconds
-	timeStep       int64 // seconds
-	keySize        int
-	valSize        int
-	clientNum      int64
-	valSizeMin     int64
-	valSizeMax     int64
-	timeCostMin    int64 // microseconds
-	timeCostMax    int64 // microseconds
-	timeCostRanges []int64
-	chartOutput    string
-	chartTitle     string
-	chartLegend    string
+	types         []uint64
+	timeLen       int64 // seconds
+	timeStep      int64 // seconds
+	keySize       int
+	valueSize     int
+	valueSizeMin  int64
+	valueSizeMax  int64
+	clientNum     int64
+	latencyMin    int64 // microseconds
+	latencyMax    int64 // microseconds
+	latencyRanges []int64
+	dataFile      string
+	dataName      string
 }
 
 type KeyValueBench struct {
@@ -81,18 +80,16 @@ func NewKeyValueBench() (*KeyValueBench, error) {
 func newKeyValueBenchOptions() (*keyValueBenchOptions, error) {
 
 	it := &keyValueBenchOptions{
-		types:       benchTypes(hflag.Value("bench_types").String()),
-		timeLen:     10, // 10 s
-		clientNum:   1,
-		keySize:     40,
-		valSize:     1 * 1024, // 1 KB
-		valSizeMin:  0,
-		valSizeMax:  0,
-		timeCostMin: 10,    // 10 us
-		timeCostMax: 100e3, // 100 ms
-		chartOutput: "bench",
-		chartTitle:  "",
-		chartLegend: "",
+		types:        benchTypes(hflag.Value("bench_types").String()),
+		timeLen:      10, // 10 s
+		clientNum:    1,
+		keySize:      40,
+		valueSize:    1 * 1024, // 1 KB
+		valueSizeMin: 0,
+		valueSizeMax: 0,
+		latencyMin:   10,    // 10 us
+		latencyMax:   100e3, // 100 ms
+		dataFile:     "lynkbench.json",
 	}
 
 	if len(it.types) < 1 {
@@ -116,26 +113,26 @@ func newKeyValueBenchOptions() (*keyValueBenchOptions, error) {
 	}
 
 	if v, ok := hflag.ValueOK("value_size"); ok {
-		if it.valSize = v.Int(); it.valSize < 1 {
-			it.valSize = 1
-		} else if it.valSize > (4 * 1024 * 1024) {
-			it.valSize = 4 * 1024 * 1024
+		if it.valueSize = v.Int(); it.valueSize < 1 {
+			it.valueSize = 1
+		} else if it.valueSize > (4 * 1024 * 1024) {
+			it.valueSize = 4 * 1024 * 1024
 		}
 	}
 
-	if v, ok := hflag.ValueOK("time_cost_min"); ok {
-		if it.timeCostMin = v.Int64(); it.timeCostMin < 1 {
-			it.timeCostMin = 1 // 1 us
-		} else if it.timeCostMin > 1e6 {
-			it.timeCostMin = 1e6 // 1 s
+	if v, ok := hflag.ValueOK("latency_min"); ok {
+		if it.latencyMin = v.Int64(); it.latencyMin < 1 {
+			it.latencyMin = 1 // 1 us
+		} else if it.latencyMin > 1e6 {
+			it.latencyMin = 1e6 // 1 s
 		}
 	}
 
-	if v, ok := hflag.ValueOK("time_cost_max"); ok {
-		it.timeCostMax = v.Int64()
+	if v, ok := hflag.ValueOK("latency_max"); ok {
+		it.latencyMax = v.Int64()
 	}
-	if (it.timeCostMin * 10) > it.timeCostMax {
-		it.timeCostMax = it.timeCostMin * 10
+	if (it.latencyMin * 10) > it.latencyMax {
+		it.latencyMax = it.latencyMin * 10
 	}
 
 	if v, ok := hflag.ValueOK("client_num"); ok {
@@ -146,42 +143,36 @@ func newKeyValueBenchOptions() (*keyValueBenchOptions, error) {
 		}
 	}
 
-	if v, ok := hflag.ValueOK("chart_output"); ok {
-		it.chartOutput = v.String()
-	}
-
-	if v, ok := hflag.ValueOK("chart_title"); ok {
-		it.chartTitle = v.String()
-	}
-
-	if v, ok := hflag.ValueOK("chart_legend"); ok {
-		it.chartLegend = v.String()
+	if v, ok := hflag.ValueOK("data_name"); ok {
+		it.dataName = v.String()
 	}
 
 	// NPS
 	it.timeStep = int64(1)
+	/**
 	if it.timeLen > 40 {
 		it.timeStep = it.timeLen / 40
 	}
 	if fix := it.timeLen % it.timeStep; fix > 0 {
 		it.timeLen += fix
 	}
+	*/
 
 	// TC
-	it.timeCostRanges = []int64{}
-	timeCostRange := ((it.timeCostMax - it.timeCostMin) >> 20)
-	if timeCostRange < it.timeCostMin {
-		timeCostRange = it.timeCostMin
+	it.latencyRanges = []int64{}
+	latencyRange := ((it.latencyMax - it.latencyMin) >> 20)
+	if latencyRange < it.latencyMin {
+		latencyRange = it.latencyMin
 	}
 	for i := 0; i < 20; i++ {
 
-		if timeCostRange > it.timeCostMax {
-			it.timeCostRanges = append(it.timeCostRanges, it.timeCostMax)
+		if latencyRange > it.latencyMax {
+			it.latencyRanges = append(it.latencyRanges, it.latencyMax)
 			break
 		}
 
-		it.timeCostRanges = append(it.timeCostRanges, timeCostRange)
-		timeCostRange = timeCostRange << 1
+		it.latencyRanges = append(it.latencyRanges, latencyRange)
+		latencyRange = latencyRange << 1
 	}
 
 	return it, nil
@@ -189,8 +180,15 @@ func newKeyValueBenchOptions() (*keyValueBenchOptions, error) {
 
 func (it *KeyValueBench) Run(fn KeyValueBenchWorker) error {
 
-	it.options.argsName = fmt.Sprintf("t%d_tc%d-%d",
-		it.options.timeLen, it.options.timeCostMin, it.options.timeCostMax)
+	var (
+		ls hcapi.DataList
+	)
+
+	if err := json.DecodeFile(it.options.dataFile, &ls); err != nil {
+		if !os.IsNotExist(err) {
+			return err
+		}
+	}
 
 	for _, typ := range it.options.types {
 
@@ -207,51 +205,45 @@ func (it *KeyValueBench) Run(fn KeyValueBenchWorker) error {
 
 			fmt.Printf("waiting %8.2f\r", cio[0]/10)
 		}
-		fmt.Printf("waiting %8.2f\n", cio[0]/10)
 
 		if err := fn.Clean(); err != nil {
 			return err
 		}
 
-		benchItem.name = it.options.chartLegend
-		if benchItem.name != "" {
-			benchItem.name += "/"
-		}
-		benchItem.name += benchTypeName(typ)
+		benchName := fmt.Sprintf("%s/%s/client-x%d",
+			it.options.dataName, benchTypeName(typ), it.options.clientNum)
 
-		if it.options.clientNum > 1 {
-			benchItem.name += fmt.Sprintf("/client-x%d", it.options.clientNum)
-		}
-
-		fmt.Printf("Bench %s ...\r", benchItem.name)
+		fmt.Printf("Bench %s Start at %s\n",
+			benchName, time.Now().Format("2006-01-02 15:04:05"))
 
 		if err := benchItem.run(fn); err != nil {
 			return err
 		}
 
-		if err := it.chartNumPerCycleLineSave(benchItem); err != nil {
-			fmt.Println(err)
-		}
-
-		if err := it.chartTimeCostSave(benchItem); err != nil {
-			fmt.Println(err)
-		}
-
 		fmt.Printf("Bench %s DONE at %s\n",
-			benchItem.name, time.Now().Format("2006-01-02 15:04:05"))
+			benchName, time.Now().Format("2006-01-02 15:04:05"))
+
+		for _, ds := range benchItem.datasets.Items {
+			ls.Set(ds)
+		}
+
+		if err := json.EncodeToFile(ls, it.options.dataFile, "  "); err != nil {
+			return err
+		}
 	}
 
 	return nil
 }
 
+/**
 func (it *KeyValueBench) chartNumPerCycleLineSave(benchItem *keyValueBenchItem) error {
 
-	if it.options.chartOutput == "" {
+	if it.options.chart == "" {
 		return nil
 	}
 
 	benchName := fmt.Sprintf("%s_%s.npc",
-		it.options.chartOutput, it.options.argsName)
+		it.options.chart, it.options.argsName)
 
 	//
 	var item hcapi.ChartEntry
@@ -270,22 +262,22 @@ func (it *KeyValueBench) chartNumPerCycleLineSave(benchItem *keyValueBenchItem) 
 
 	item.Options.Title = fmt.Sprintf(
 		"Queries Per Second (key-size %d, value-size %d)",
-		it.options.keySize, it.options.valSize)
+		it.options.keySize, it.options.valueSize)
 
 	item.Options.X.Title = "Seconds"
 	item.Options.Y.Title = "Queries Per Second"
 
 	if len(benchItem.status.npsMap) > 0 {
 
-		for i := len(benchItem.status.npsMap) - 1; i > 0; i-- {
-			benchItem.status.npsMap[i].num =
-				(benchItem.status.npsMap[i].num - benchItem.status.npsMap[i-1].num) / it.options.timeStep
-		}
-		benchItem.status.npsMap[0].num = benchItem.status.npsMap[0].num / it.options.timeStep
+		// for i := len(benchItem.status.npsMap) - 1; i > 0; i-- {
+		// 	benchItem.status.npsMap[i].num =
+		// 		(benchItem.status.npsMap[i].num - benchItem.status.npsMap[i-1].num) / it.options.timeStep
+		// }
+		// benchItem.status.npsMap[0].num = benchItem.status.npsMap[0].num / it.options.timeStep
 
 		item.Type = hcapi.ChartTypeLine
 
-		p := item.Dataset(benchItem.name)
+		p := item.Dataset(benchName)
 		p.Points = nil
 
 		for _, v := range benchItem.status.npsMap {
@@ -301,18 +293,19 @@ func (it *KeyValueBench) chartNumPerCycleLineSave(benchItem *keyValueBenchItem) 
 	}
 
 	return hcutil.Render(&item, &hcapi.ChartRenderOptions{
-		Name: benchName,
+		Name:      benchName,
+		SvgEnable: true,
 	})
 }
 
 func (it *KeyValueBench) chartTimeCostSave(benchItem *keyValueBenchItem) error {
 
-	if it.options.chartOutput == "" {
+	if it.options.chart == "" {
 		return nil
 	}
 
 	benchName := fmt.Sprintf("%s_%s.tc",
-		it.options.chartOutput, it.options.argsName)
+		it.options.chart, it.options.argsName)
 
 	//
 	var item hcapi.ChartEntry
@@ -331,19 +324,19 @@ func (it *KeyValueBench) chartTimeCostSave(benchItem *keyValueBenchItem) error {
 
 	item.Options.Title = fmt.Sprintf(
 		"Percentage of the queries served within a certain time (key-size %d, value-size %d)",
-		it.options.keySize, it.options.valSize)
+		it.options.keySize, it.options.valueSize)
 
 	item.Options.X.Title = "Latency Time"
 	item.Options.Y.Title = "Percentage of Time-Cost (%)"
 
-	if n := len(benchItem.status.timeCostMap); n > 0 {
+	if n := len(benchItem.status.latencyMap); n > 0 {
 
 		item.Type = hcapi.ChartTypeBar
 		item.Data.Labels = []string{}
 
-		p := item.Dataset(benchItem.name)
+		p := item.Dataset(benchName)
 
-		for _, v := range benchItem.status.timeCostMap {
+		for _, v := range benchItem.status.latencyMap {
 			if v.time > 1e6 {
 				item.Data.Labels = append(item.Data.Labels, fmt.Sprintf("%d s", v.time/1e6))
 			} else if v.time > 1e3 {
@@ -362,19 +355,21 @@ func (it *KeyValueBench) chartTimeCostSave(benchItem *keyValueBenchItem) error {
 	}
 
 	return hcutil.Render(&item, &hcapi.ChartRenderOptions{
-		Name: benchName,
+		Name:      benchName,
+		SvgEnable: true,
 	})
 }
+*/
 
 /**
 func (it *KeyValueBench) chartNumPerCycleSave(benchItem *keyValueBenchItem) error {
 
-	if it.options.chartOutput == "" {
+	if it.options.chart == "" {
 		return nil
 	}
 
 	benchName := fmt.Sprintf("%s_%s.npc",
-		it.options.chartOutput, it.options.argsName)
+		it.options.chart, it.options.argsName)
 
 	//
 	var item hcapi.ChartEntry
@@ -393,7 +388,7 @@ func (it *KeyValueBench) chartNumPerCycleSave(benchItem *keyValueBenchItem) erro
 
 	item.Options.Title = fmt.Sprintf(
 		"Queries Per Second (key-size %d, value-size %d)",
-		it.options.keySize, it.options.valSize)
+		it.options.keySize, it.options.valueSize)
 
 	item.Options.X.Title = "Seconds"
 	item.Options.Y.Title = "Queries Per Second"
@@ -409,7 +404,7 @@ func (it *KeyValueBench) chartNumPerCycleSave(benchItem *keyValueBenchItem) erro
 		item.Type = hcapi.ChartTypeBar
 		item.Data.Labels = []string{}
 
-		p := item.Dataset(benchItem.name)
+		p := item.Dataset(benchName)
 
 		for _, v := range benchItem.status.npsMap {
 			item.Data.Labels = append(item.Data.Labels, fmt.Sprintf("%d", v.time))

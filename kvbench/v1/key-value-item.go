@@ -16,7 +16,10 @@ package kvbench
 
 import (
 	"errors"
+	"fmt"
 	"time"
+
+	"github.com/hooto/hchart/v2/hcapi"
 )
 
 const (
@@ -25,12 +28,12 @@ const (
 )
 
 type keyValueBenchItem struct {
-	name    string
-	options *keyValueBenchOptions
-	status  *keyValueBenchStatus
-	typ     uint64
-	quit    bool
-	data    chan *keyValueItem
+	options  *keyValueBenchOptions
+	status   *keyValueBenchStatus
+	typ      uint64
+	quit     bool
+	data     chan *keyValueItem
+	datasets hcapi.DataList
 }
 
 type keyValueBenchStatus struct {
@@ -39,7 +42,8 @@ type keyValueBenchStatus struct {
 	err         int64
 	nps         float64
 	npsMap      []*keyValueWriteUsageItem
-	timeCostMap []*keyValueWriteUsageItem
+	latencyMap  []*keyValueWriteUsageItem
+	latencyTime int64
 }
 
 func newkeyValueBenchItem(
@@ -63,15 +67,19 @@ func (it *keyValueBenchStatus) sync(v ResultStatus, tc int64) {
 		it.err += 1
 	}
 
+	it.latencyTime += tc
+
 	//
-	if tc > it.options.timeCostMax {
-		tc = it.options.timeCostMax
-	} else if tc < it.options.timeCostMin {
-		tc = it.options.timeCostMin
+	if tc > it.options.latencyMax {
+		tc = it.options.latencyMax
+	} else if tc < it.options.latencyMin {
+		tc = it.options.latencyMin
 	}
-	for i := 1; i < len(it.timeCostMap); i++ {
-		if tc < it.timeCostMap[i].time {
-			it.timeCostMap[i-1].num++
+
+	//
+	for i := 1; i < len(it.latencyMap); i++ {
+		if tc < it.latencyMap[i].time {
+			it.latencyMap[i-1].num++
 			break
 		}
 	}
@@ -95,12 +103,12 @@ func (it *keyValueBenchItem) dataCreate() {
 		if uint64Allow(it.typ, BenchTypeRandWrite) {
 			it.data <- &keyValueItem{
 				Key:   randKey(it.options.keySize, 0),
-				Value: randValue(it.options.valSize),
+				Value: randValue(it.options.valueSize),
 			}
 		} else if uint64Allow(it.typ, BenchTypeSeqWrite) {
 			it.data <- &keyValueItem{
 				Key:   randKey(it.options.keySize, i),
-				Value: randValue(it.options.valSize),
+				Value: randValue(it.options.valueSize),
 			}
 		}
 	}
@@ -133,8 +141,8 @@ func (it *keyValueBenchItem) runWrite(fn KeyValueBenchWorker) error {
 
 	go it.dataCreate()
 
-	for _, v := range it.options.timeCostRanges {
-		it.status.timeCostMap = append(it.status.timeCostMap, &keyValueWriteUsageItem{
+	for _, v := range it.options.latencyRanges {
+		it.status.latencyMap = append(it.status.latencyMap, &keyValueWriteUsageItem{
 			time: v,
 		})
 	}
@@ -146,6 +154,7 @@ func (it *keyValueBenchItem) runWrite(fn KeyValueBenchWorker) error {
 	)
 	defer ticker.Stop()
 
+	it.status.npsSet(0)
 	go func() {
 		for {
 			select {
@@ -203,6 +212,66 @@ func (it *keyValueBenchItem) runWrite(fn KeyValueBenchWorker) error {
 
 	it.status.nps = (float64(it.status.ok+it.status.err) / float64(gtc)) * 1e6
 
+	if it.status.ok > 0 && len(it.status.npsMap) > 0 {
+
+		ds := hcapi.NewDataItem(it.options.dataName)
+		ds.AttrSet(benchTypeName(it.typ))
+		ds.AttrSet("throughput")
+		ds.AttrSet(fmt.Sprintf("client-num:%d", it.options.clientNum))
+		ds.AttrSet(fmt.Sprintf("key-value-size:%d-%d",
+			it.options.keySize, it.options.valueSize))
+		for _, av := range fn.Attrs() {
+			ds.AttrSet(av)
+		}
+
+		for _, v := range it.status.npsMap {
+
+			ds.Points = append(ds.Points, &hcapi.DataPoint{
+				X: float64(v.time),
+				Y: float64(v.num),
+			})
+		}
+
+		it.datasets.Set(ds)
+	}
+
+	if it.status.ok > 0 && len(it.status.latencyMap) > 0 {
+
+		ds := hcapi.NewDataItem(it.options.dataName)
+		ds.AttrSet(benchTypeName(it.typ))
+		ds.AttrSet("latency-avg")
+		ds.AttrSet(fmt.Sprintf("client-num:%d", it.options.clientNum))
+		ds.AttrSet(fmt.Sprintf("key-value-size:%d-%d",
+			it.options.keySize, it.options.valueSize))
+		for _, av := range fn.Attrs() {
+			ds.AttrSet(av)
+		}
+		ds.Points = append(ds.Points, &hcapi.DataPoint{
+			Y: float64Round(float64(it.status.latencyTime)/float64(it.status.ok), 4),
+		})
+		it.datasets.Set(ds)
+
+		ds = hcapi.NewDataItem(it.options.dataName)
+		ds.AttrSet(benchTypeName(it.typ))
+		ds.AttrSet("latency")
+		ds.AttrSet(fmt.Sprintf("client-num:%d", it.options.clientNum))
+		ds.AttrSet(fmt.Sprintf("key-value-size:%d-%d",
+			it.options.keySize, it.options.valueSize))
+		for _, av := range fn.Attrs() {
+			ds.AttrSet(av)
+		}
+
+		for _, v := range it.status.latencyMap {
+
+			ds.Points = append(ds.Points, &hcapi.DataPoint{
+				X: float64(v.time),
+				Y: float64(v.num),
+			})
+		}
+
+		it.datasets.Set(ds)
+	}
+
 	return nil
 }
 
@@ -217,7 +286,7 @@ func (it *keyValueBenchItem) runRead(fn KeyValueBenchWorker) error {
 
 			var (
 				key []byte
-				val = RandBytes(it.options.valSize)
+				val = RandBytes(it.options.valueSize)
 			)
 
 			if it.typ == BenchTypeSeqRead {
@@ -241,8 +310,8 @@ func (it *keyValueBenchItem) runRead(fn KeyValueBenchWorker) error {
 		cq <- fn
 	}
 
-	for _, v := range it.options.timeCostRanges {
-		it.status.timeCostMap = append(it.status.timeCostMap, &keyValueWriteUsageItem{
+	for _, v := range it.options.latencyRanges {
+		it.status.latencyMap = append(it.status.latencyMap, &keyValueWriteUsageItem{
 			time: v,
 		})
 	}
@@ -254,6 +323,7 @@ func (it *keyValueBenchItem) runRead(fn KeyValueBenchWorker) error {
 	)
 	defer ticker.Stop()
 
+	it.status.npsSet(0)
 	go func() {
 		for {
 			select {
@@ -311,6 +381,68 @@ func (it *keyValueBenchItem) runRead(fn KeyValueBenchWorker) error {
 	}
 
 	it.status.nps = (float64(it.status.ok+it.status.err) / float64(gtc)) * 1e6
+
+	if it.status.ok > 0 && len(it.status.npsMap) > 0 {
+
+		ds := hcapi.NewDataItem(it.options.dataName)
+		ds.AttrSet(benchTypeName(it.typ))
+		ds.AttrSet("throughput")
+		ds.AttrSet(fmt.Sprintf("client-num:%d", it.options.clientNum))
+		ds.AttrSet(fmt.Sprintf("key-value-size:%d-%d",
+			it.options.keySize, it.options.valueSize))
+		for _, av := range fn.Attrs() {
+			ds.AttrSet(av)
+		}
+
+		for _, v := range it.status.npsMap {
+
+			ds.Points = append(ds.Points, &hcapi.DataPoint{
+				X: float64(v.time),
+				Y: float64(v.num),
+			})
+		}
+
+		it.datasets.Set(ds)
+	}
+
+	if it.status.ok > 0 && len(it.status.latencyMap) > 0 {
+
+		ds := hcapi.NewDataItem(it.options.dataName)
+		ds.AttrSet(benchTypeName(it.typ))
+		ds.AttrSet("latency-avg")
+		ds.AttrSet(fmt.Sprintf("client-num:%d", it.options.clientNum))
+		ds.AttrSet(fmt.Sprintf("key-value-size:%d-%d",
+			it.options.keySize, it.options.valueSize))
+		for _, av := range fn.Attrs() {
+			ds.AttrSet(av)
+		}
+		ds.Points = append(ds.Points, &hcapi.DataPoint{
+			Y: float64Round(float64(it.status.latencyTime)/float64(it.status.ok), 4),
+		})
+		it.datasets.Set(ds)
+
+		//
+		ds = hcapi.NewDataItem(it.options.dataName)
+		ds.AttrSet(benchTypeName(it.typ))
+		ds.AttrSet("latency")
+		ds.AttrSet(fmt.Sprintf("client-num:%d", it.options.clientNum))
+		ds.AttrSet(fmt.Sprintf("key-value-size:%d-%d",
+			it.options.keySize, it.options.valueSize))
+		for _, av := range fn.Attrs() {
+			ds.AttrSet(av)
+		}
+
+		for _, v := range it.status.latencyMap {
+
+			ds.Points = append(ds.Points, &hcapi.DataPoint{
+				X: float64(v.time),
+				Y: float64(v.num),
+				// Y: float64Round(float64(100*v.num)/n, 4),
+			})
+		}
+
+		it.datasets.Set(ds)
+	}
 
 	return nil
 }
